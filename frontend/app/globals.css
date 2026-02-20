@@ -1,0 +1,146 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI",
+      system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    background-color: #08081a;
+    color: #fff;
+  }
+}
+
+@layer components {
+  /* Glass morphism card */
+  .glass-card {
+    border-radius: 24px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: rgba(255, 255, 255, 0.04);
+    backdrop-filter: blur(24px);
+    -webkit-backdrop-filter: blur(24px);
+    box-shadow:
+      0 4px 40px rgba(0, 0, 0, 0.35),
+      inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  /* Animated gradient blobs */
+  .blob {
+    position: absolute;
+    width: 640px;
+    height: 640px;
+    border-radius: 50%;
+    filter: blur(90px);
+    opacity: 0.22;
+    animation: blobDrift 22s ease-in-out infinite;
+    pointer-events: none;
+  }
+
+  .blob-purple {
+    background: radial-gradient(circle at 40% 60%, #7c3aed, #4c1d95);
+    top: -15%;
+    left: -12%;
+    animation-delay: 0s;
+  }
+
+  .blob-blue {
+    background: radial-gradient(circle at 60% 40%, #2563eb, #1e3a8a);
+    top: 25%;
+    right: -16%;
+    animation-delay: -8s;
+  }
+
+  .blob-indigo {
+    background: radial-gradient(circle at 50% 50%, #4f46e5, #312e81);
+    bottom: -18%;
+    left: 28%;
+    animation-delay: -16s;
+  }
+}
+
+@layer utilities {
+  .animate-fade-in {
+    animation: fadeIn 0.45s ease-out both;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Keyframes                                                           */
+/* ------------------------------------------------------------------ */
+
+@keyframes blobDrift {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+  }
+  33% {
+    transform: translate(2.5%, -4%) scale(1.06);
+  }
+  66% {
+    transform: translate(-3%, 3%) scale(0.94);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Range input — cross-browser thumb styling                           */
+/* ------------------------------------------------------------------ */
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 6px;
+  border-radius: 3px;
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.35);
+  border: none;
+  cursor: pointer;
+}
+
+/* Number input — remove spin arrows */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+}
