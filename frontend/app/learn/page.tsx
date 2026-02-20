@@ -1,3 +1,5 @@
+"use client";
+
 import Link from "next/link";
 import { LEARN_INDEX } from "@/content/learnContent";
 
