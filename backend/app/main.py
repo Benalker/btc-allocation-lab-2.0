@@ -1,18 +1,25 @@
 """
 BTC Allocation Lab 2.0 – FastAPI backend
-Educational stub optimizer with simulated data.
+Stub optimizer + real market data via yfinance.
 NOT financial advice.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import time
 from typing import Literal
 
 import numpy as np
-from fastapi import FastAPI, Query
+import pandas as pd
+import yfinance as yf
+from cachetools import TTLCache
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger("btc-lab")
 
 app = FastAPI(title="BTC Allocation Lab API", version="2.0.0")
 
@@ -333,6 +340,7 @@ class AssetHistoryResponse(BaseModel):
     prices: list[PricePoint]
     stats: AssetStats
     events: list[MarketEvent]
+    data_source: str = "Yahoo Finance"
 
 
 # ── Hard-coded market events ──────────────────────────────────────────────────
@@ -411,83 +419,111 @@ GLOBAL_EVENTS: list[dict] = [
 ]
 
 
-# ── Simulated price generation ────────────────────────────────────────────────
+# ── Real market data via yfinance ─────────────────────────────────────────────
 
-TICKER_SIM_PARAMS: dict[str, dict] = {
-    "SPY":  {"annual_ret": 0.108, "annual_vol": 0.178, "start": 100.0},
-    "QQQ":  {"annual_ret": 0.128, "annual_vol": 0.220, "start": 100.0},
-    "VTI":  {"annual_ret": 0.105, "annual_vol": 0.178, "start": 100.0},
-    "IWM":  {"annual_ret": 0.075, "annual_vol": 0.215, "start": 100.0},
-    "EFA":  {"annual_ret": 0.068, "annual_vol": 0.165, "start": 100.0},
-    "EEM":  {"annual_ret": 0.055, "annual_vol": 0.220, "start": 100.0},
-    "AGG":  {"annual_ret": 0.028, "annual_vol": 0.065, "start": 100.0},
-    "TLT":  {"annual_ret": 0.015, "annual_vol": 0.145, "start": 100.0},
-    "BND":  {"annual_ret": 0.028, "annual_vol": 0.062, "start": 100.0},
-    "HYG":  {"annual_ret": 0.050, "annual_vol": 0.090, "start": 100.0},
-    "TIP":  {"annual_ret": 0.032, "annual_vol": 0.050, "start": 100.0},
-    "GLD":  {"annual_ret": 0.072, "annual_vol": 0.148, "start": 100.0},
-    "DBC":  {"annual_ret": 0.040, "annual_vol": 0.185, "start": 100.0},
-    "VNQ":  {"annual_ret": 0.068, "annual_vol": 0.198, "start": 100.0},
-    "BIL":  {"annual_ret": 0.038, "annual_vol": 0.004, "start": 100.0},
-    "BTC":  {"annual_ret": 0.450, "annual_vol": 0.680, "start": 100.0},
-    "ETH":  {"annual_ret": 0.380, "annual_vol": 0.780, "start": 100.0},
+# Map internal tickers → yfinance symbols
+YF_TICKER_MAP: dict[str, str] = {
+    "BTC": "BTC-USD",
+    "ETH": "ETH-USD",
 }
 
+# yfinance period strings
+RANGE_MAP: dict[str, str] = {
+    "1y": "1y",
+    "3y": "3y",
+    "5y": "5y",
+    "max": "max",
+}
 
-def _generate_history(ticker: str, years: int) -> list[PricePoint]:
-    params = TICKER_SIM_PARAMS.get(ticker, {"annual_ret": 0.07, "annual_vol": 0.15, "start": 100.0})
-    dt = 1 / 252
-    n = years * 252
-    mu = params["annual_ret"]
-    sigma = params["annual_vol"]
+VALID_TICKERS: list[str] = list(ASSET_META.keys())
 
-    # Deterministic seed per ticker
-    seed = int.from_bytes(ticker.encode(), "big") % (2 ** 31)
-    rng = np.random.default_rng(seed)
+# TTL cache: 100 entries, 6-hour TTL
+_history_cache: TTLCache = TTLCache(maxsize=100, ttl=6 * 3600)
 
-    daily = rng.normal((mu - 0.5 * sigma ** 2) * dt, sigma * math.sqrt(dt), n)
-    prices = params["start"] * np.exp(np.cumsum(np.insert(daily, 0, 0)))
 
-    # Compute drawdowns
-    running_max = np.maximum.accumulate(prices)
-    drawdowns = (prices - running_max) / running_max  # ≤ 0
+def _fetch_real_history(ticker: str, period: str) -> tuple[list[PricePoint], AssetStats]:
+    """
+    Download real OHLC data from Yahoo Finance, compute drawdowns and stats.
+    Returns (price_points, stats). Raises ValueError on empty/bad data.
+    Retries once on rate-limit errors with a short back-off.
+    """
+    yf_ticker = YF_TICKER_MAP.get(ticker, ticker)
 
-    # Generate dates
-    from datetime import date, timedelta
-    end_date = date(2025, 6, 30)
-    start_date = end_date - timedelta(days=years * 365)
+    def _download() -> pd.DataFrame:
+        # Use Ticker.history() — more reliable against transient rate limits
+        # than yf.download() for single-ticker requests.
+        t = yf.Ticker(yf_ticker)
+        return t.history(
+            period=period,
+            interval="1d",
+            auto_adjust=True,
+        )
 
-    result: list[PricePoint] = []
-    # Down-sample to weekly to keep response small
-    step = max(1, n // (years * 52))
-    for i in range(0, len(prices), step):
-        d = start_date + timedelta(days=int(i * 365 / 252))
-        result.append(PricePoint(
-            date=d.isoformat(),
-            price=round(float(prices[i]), 2),
+    df = _download()
+    if df is None or df.empty:
+        # One retry after a short back-off
+        logger.warning("Empty response for %s, retrying in 5s…", yf_ticker)
+        time.sleep(5)
+        df = _download()
+
+    if df is None or df.empty:
+        raise ValueError(f"No data returned by Yahoo Finance for '{yf_ticker}'")
+
+    # Normalize columns: newer yfinance may return MultiIndex
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    if "Close" not in df.columns:
+        raise ValueError(f"'Close' column not found for '{yf_ticker}'")
+
+    closes: pd.Series = df["Close"].ffill().dropna()
+
+    if len(closes) < 5:
+        raise ValueError(f"Insufficient data for '{yf_ticker}' (got {len(closes)} rows)")
+
+    close_arr = closes.to_numpy(dtype=float)
+
+    # Drawdown series
+    running_max = np.maximum.accumulate(close_arr)
+    drawdowns = (close_arr - running_max) / running_max  # ≤ 0
+
+    # Weekly down-sample (≈52 points/year) to keep payload small
+    n = len(close_arr)
+    years_approx = max((closes.index[-1] - closes.index[0]).days / 365.25, 0.1)
+    step = max(1, n // int(years_approx * 52 + 1))
+
+    price_points: list[PricePoint] = []
+    for i in range(0, n, step):
+        price_points.append(PricePoint(
+            date=closes.index[i].date().isoformat(),
+            price=round(float(close_arr[i]), 4),
             drawdown=round(float(drawdowns[i]), 4),
         ))
-    return result
+    # Always include the last trading day
+    if price_points[-1].date != closes.index[-1].date().isoformat():
+        price_points.append(PricePoint(
+            date=closes.index[-1].date().isoformat(),
+            price=round(float(close_arr[-1]), 4),
+            drawdown=round(float(drawdowns[-1]), 4),
+        ))
 
+    # ── Statistics ────────────────────────────────────────────────────────────
+    total_ret = (close_arr[-1] / close_arr[0]) - 1
+    cagr = (close_arr[-1] / close_arr[0]) ** (1.0 / years_approx) - 1
 
-def _compute_stats(prices_pts: list[PricePoint], years: int) -> AssetStats:
-    prices = [p.price for p in prices_pts]
-    drawdowns = [p.drawdown for p in prices_pts]
-    total_ret = (prices[-1] / prices[0]) - 1
-    cagr = (prices[-1] / prices[0]) ** (1 / years) - 1
+    # Daily log-returns → annualised vol
+    log_rets = np.log(close_arr[1:] / close_arr[:-1])
+    annual_vol = float(np.std(log_rets)) * math.sqrt(252)
 
-    # Approx vol from weekly returns
-    weekly_rets = [
-        math.log(prices[i] / prices[i - 1]) for i in range(1, len(prices))
+    # Worst single calendar-month approx (every ~21 trading days)
+    monthly_simple = [
+        (close_arr[min(i + 21, n - 1)] / close_arr[i]) - 1
+        for i in range(0, n - 1, 21)
     ]
-    weekly_vol = float(np.std(weekly_rets))
-    annual_vol = weekly_vol * math.sqrt(52)
+    worst_month = float(min(monthly_simple)) if monthly_simple else 0.0
+    max_dd = float(drawdowns.min())
 
-    # Worst "weekly" period as proxy for worst month
-    worst_month = min(weekly_rets) if weekly_rets else 0.0
-    max_dd = min(drawdowns)
-
-    return AssetStats(
+    stats = AssetStats(
         cagr=round(cagr, 4),
         vol_annual=round(annual_vol, 4),
         max_drawdown=round(max_dd, 4),
@@ -495,40 +531,60 @@ def _compute_stats(prices_pts: list[PricePoint], years: int) -> AssetStats:
         total_return=round(total_ret, 4),
     )
 
+    return price_points, stats
+
 
 # ── History endpoint ──────────────────────────────────────────────────────────
 
-VALID_TICKERS = list(TICKER_SIM_PARAMS.keys())
-RANGE_MAP = {"1y": 1, "3y": 3, "5y": 5}
-
-
 @app.get("/asset-history", response_model=AssetHistoryResponse)
 def asset_history(
-    ticker: str = Query("SPY", description="Asset ticker"),
-    range: str = Query("3y", description="Time range: 1y | 3y | 5y"),
+    ticker: str = Query("SPY", description="Asset ticker (e.g. SPY, BTC, GLD)"),
+    range: str = Query("3y", description="Time range: 1y | 3y | 5y | max"),
 ) -> AssetHistoryResponse:
     ticker = ticker.upper()
-    if ticker not in TICKER_SIM_PARAMS:
-        ticker = "SPY"
-    years = RANGE_MAP.get(range, 3)
+    if ticker not in ASSET_META:
+        raise HTTPException(status_code=400, detail=f"Unknown ticker '{ticker}'. Use /tickers to list valid symbols.")
 
-    prices = _generate_history(ticker, years)
-    stats = _compute_stats(prices, years)
+    period = RANGE_MAP.get(range, "3y")
+    cache_key = (ticker, period)
+
+    # ── Cache lookup ──────────────────────────────────────────────────────────
+    if cache_key in _history_cache:
+        price_points, stats = _history_cache[cache_key]
+        logger.info("Cache hit: %s %s", ticker, period)
+    else:
+        logger.info("Fetching from Yahoo Finance: %s %s", ticker, period)
+        try:
+            price_points, stats = _fetch_real_history(ticker, period)
+            _history_cache[cache_key] = (price_points, stats)
+        except Exception as exc:
+            logger.error("yfinance error for %s: %s", ticker, exc)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Could not fetch data for '{ticker}' from Yahoo Finance: {exc}",
+            )
+
     meta = ASSET_META.get(ticker, {"name": ticker, "asset_class": "other"})
+    years_approx = len(price_points) // 52 or 1
 
     return AssetHistoryResponse(
         ticker=ticker,
         name=meta["name"],
-        range_years=years,
-        prices=prices,
+        range_years=years_approx,
+        prices=price_points,
         stats=stats,
-        events=GLOBAL_EVENTS,  # always show all global events as context
+        events=GLOBAL_EVENTS,
+        data_source="Yahoo Finance (via yfinance)",
     )
 
 
 @app.get("/tickers")
 def list_tickers():
     return [
-        {"ticker": t, "name": ASSET_META[t]["name"], "asset_class": ASSET_META[t]["asset_class"]}
+        {
+            "ticker": t,
+            "name": ASSET_META[t]["name"],
+            "asset_class": ASSET_META[t]["asset_class"],
+        }
         for t in VALID_TICKERS
     ]

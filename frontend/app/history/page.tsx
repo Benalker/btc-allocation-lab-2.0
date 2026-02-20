@@ -122,11 +122,10 @@ export default function HistoryPage() {
             Asset History & Insights
           </h1>
           <p className="mt-3 text-base text-white/50">
-            Simulated historical data with real market context.
+            Real historical prices via Yahoo Finance.
             <br />
             <span className="text-xs text-white/30">
-              Prices are educational simulations — not real historical data.
-              Not financial advice.
+              For educational purposes only. Not financial advice.
             </span>
           </p>
         </div>
@@ -184,8 +183,12 @@ export default function HistoryPage() {
         )}
 
         {error && (
-          <div className="glass-card p-6 text-center text-red-400">
-            {error} — make sure the backend is running on port 8000.
+          <div className="glass-card p-6 text-center">
+            <p className="mb-1 font-semibold text-red-400">Data unavailable</p>
+            <p className="text-sm text-white/50">{error}</p>
+            <p className="mt-2 text-xs text-white/30">
+              Make sure the backend is running on port 8000, or try a different ticker / range.
+            </p>
           </div>
         )}
 
@@ -202,9 +205,14 @@ export default function HistoryPage() {
 
             {/* Price chart */}
             <div className="glass-card p-6">
-              <h2 className="mb-4 text-[10px] font-semibold uppercase tracking-widest text-white/40">
-                {data.name} ({data.ticker}) — Simulated Price
-              </h2>
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-[10px] font-semibold uppercase tracking-widest text-white/40">
+                  {data.name} ({data.ticker}) — Close Price
+                </h2>
+                <span className="rounded-lg bg-emerald-500/10 px-2 py-0.5 text-[10px] font-medium text-emerald-400">
+                  {data.data_source}
+                </span>
+              </div>
               <ResponsiveContainer width="100%" height={240}>
                 <ComposedChart data={data.prices} margin={{ top: 5, right: 15, bottom: 20, left: 10 }}>
                   <XAxis

@@ -96,6 +96,7 @@ export interface AssetHistoryResponse {
   prices: PricePoint[];
   stats: AssetStats;
   events: MarketEvent[];
+  data_source: string;
 }
 
 export interface TickerMeta {
