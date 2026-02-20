@@ -8,18 +8,34 @@ from __future__ import annotations
 
 import logging
 import math
-import time
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import pandas as pd
+import requests_cache
 import yfinance as yf
 from cachetools import TTLCache
+from curl_cffi import requests as curl_requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger("btc-lab")
+
+# ── HTTP-level cache (disk, SQLite) + browser-impersonating session ───────────
+# requests_cache stores raw HTTP responses for 24 h so yfinance barely
+# touches Yahoo Finance on repeated restarts.
+_CACHE_DIR = Path(__file__).parent.parent / ".yf_cache"
+_CACHE_DIR.mkdir(exist_ok=True)
+
+_http_session = requests_cache.CachedSession(
+    cache_name=str(_CACHE_DIR / "yf_http"),
+    backend="sqlite",
+    expire_after=86_400,          # 24-hour HTTP cache
+)
+# Wrap with curl_cffi for Chrome impersonation (bypasses Yahoo rate-limits)
+_curl_session = curl_requests.Session(impersonate="chrome")
 
 app = FastAPI(title="BTC Allocation Lab API", version="2.0.0")
 
@@ -437,34 +453,24 @@ RANGE_MAP: dict[str, str] = {
 
 VALID_TICKERS: list[str] = list(ASSET_META.keys())
 
-# TTL cache: 100 entries, 6-hour TTL
+# Fresh cache: TTL 6 h — fast path for normal requests
 _history_cache: TTLCache = TTLCache(maxsize=100, ttl=6 * 3600)
+# Stale store: never expires — fallback when Yahoo is unreachable
+_stale_store: dict[tuple[str, str], tuple[list, object]] = {}
 
 
 def _fetch_real_history(ticker: str, period: str) -> tuple[list[PricePoint], AssetStats]:
     """
-    Download real OHLC data from Yahoo Finance, compute drawdowns and stats.
-    Returns (price_points, stats). Raises ValueError on empty/bad data.
-    Retries once on rate-limit errors with a short back-off.
+    Download real OHLC close prices from Yahoo Finance.
+    Uses curl_cffi session (Chrome impersonation) to bypass rate limits.
+    Raises ValueError on empty / bad data — caller handles HTTP error.
     """
     yf_ticker = YF_TICKER_MAP.get(ticker, ticker)
+    t = yf.Ticker(yf_ticker, session=_curl_session)
+    df: pd.DataFrame = t.history(period=period, interval="1d", auto_adjust=True)
 
-    def _download() -> pd.DataFrame:
-        # Use Ticker.history() — more reliable against transient rate limits
-        # than yf.download() for single-ticker requests.
-        t = yf.Ticker(yf_ticker)
-        return t.history(
-            period=period,
-            interval="1d",
-            auto_adjust=True,
-        )
-
-    df = _download()
     if df is None or df.empty:
-        # One retry after a short back-off
-        logger.warning("Empty response for %s, retrying in 5s…", yf_ticker)
-        time.sleep(5)
-        df = _download()
+        raise ValueError(f"Yahoo Finance returned no data for '{yf_ticker}' (period={period})")
 
     if df is None or df.empty:
         raise ValueError(f"No data returned by Yahoo Finance for '{yf_ticker}'")
@@ -548,24 +554,42 @@ def asset_history(
     period = RANGE_MAP.get(range, "3y")
     cache_key = (ticker, period)
 
-    # ── Cache lookup ──────────────────────────────────────────────────────────
+    stale = False
+
+    # ── 1. Fresh TTL cache ─────────────────────────────────────────────────────
     if cache_key in _history_cache:
         price_points, stats = _history_cache[cache_key]
-        logger.info("Cache hit: %s %s", ticker, period)
+        logger.info("Cache hit (fresh): %s %s", ticker, period)
+
     else:
-        logger.info("Fetching from Yahoo Finance: %s %s", ticker, period)
+        # ── 2. Fetch from Yahoo Finance ───────────────────────────────────────
+        logger.info("Fetching live from Yahoo Finance: %s %s", ticker, period)
         try:
             price_points, stats = _fetch_real_history(ticker, period)
+            # Populate both caches on success
             _history_cache[cache_key] = (price_points, stats)
+            _stale_store[cache_key] = (price_points, stats)
+
         except Exception as exc:
-            logger.error("yfinance error for %s: %s", ticker, exc)
-            raise HTTPException(
-                status_code=502,
-                detail=f"Could not fetch data for '{ticker}' from Yahoo Finance: {exc}",
-            )
+            logger.error("yfinance failed for %s %s: %s", ticker, period, exc)
+
+            # ── 3. Stale-store fallback ───────────────────────────────────────
+            if cache_key in _stale_store:
+                price_points, stats = _stale_store[cache_key]
+                stale = True
+                logger.warning("Serving stale data for %s %s", ticker, period)
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "upstream_failed",
+                        "message": f"Yahoo Finance could not return data for '{ticker}': {exc}",
+                        "suggestion": "Retry in a few seconds, or try a different ticker/range.",
+                    },
+                )
 
     meta = ASSET_META.get(ticker, {"name": ticker, "asset_class": "other"})
-    years_approx = len(price_points) // 52 or 1
+    years_approx = max(len(price_points) // 52, 1)
 
     return AssetHistoryResponse(
         ticker=ticker,
@@ -574,7 +598,7 @@ def asset_history(
         prices=price_points,
         stats=stats,
         events=GLOBAL_EVENTS,
-        data_source="Yahoo Finance (via yfinance)",
+        data_source="Yahoo Finance (via yfinance)" + (" — stale cache" if stale else ""),
     )
 
 
